@@ -2,10 +2,11 @@ from flask import Flask, request
 from flask_cors import CORS
 import pdfplumber
 import spacy
-from spacy.matcher import Matcher
-from composio import Composio
 import base64
 import io
+from spacy.matcher import Matcher
+import os
+from composio import Composio
 
 # --- Load NLP Model ---
 nlp = spacy.load("en_core_web_sm")
@@ -32,12 +33,15 @@ def find_attachments(parts):
             attachments.extend(find_attachments(part["parts"]))
     return attachments
 
-# --- Global app ---
+# --- Flask App Setup ---
 app = Flask(__name__)
 CORS(app)
-composio = Composio(api_key="ak_DNQlLvKJKdhEaOpBDQ07")
 
-# --- Job Description ---
+# --- Load Composio API Key from Environment ---
+COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY")  # <--- Set this in your system or GitHub secrets
+composio = Composio(api_key=COMPOSIO_API_KEY)
+
+# --- Default JD (you can replace this safely) ---
 JD_TEXT = """
 We are hiring a Python developer with machine learning experience.
 Must know Python, spaCy, and scikit-learn.
@@ -45,35 +49,34 @@ Experience with Flask, React, and SQL is a huge plus.
 """
 jd_keywords = extract_keywords(JD_TEXT)
 
-# --- Route to list all email subjects and process attachments ---
+# --- Route to process emails ---
 @app.route("/process-emails")
 def process_emails():
-    # Dynamic Gmail account selection
-    entity_id = request.args.get("entity_id", "pg-test-f2044cb2-7e34-4785-a8d4-19857f389df7")
+    # Use dynamic entity ID from request or environment
+    entity_id = request.args.get("entity_id") or os.getenv("COMPOSIO_ENTITY_ID")
+
+    if not entity_id:
+        return {"status": "error", "message": "Entity ID missing"}, 400
+
     print(f"Using Composio Entity ID: {entity_id}")
 
-    # 1. Fetch all inbox emails
     try:
         search_response = composio.tools.execute(
             slug="GMAIL_FETCH_EMAILS",
-            arguments={"userId": "me", "query": ""},  # empty query fetches all inbox emails
+            arguments={"userId": "me", "query": ""},
             dangerously_skip_version_check=True,
             user_id=entity_id
         )
     except Exception as e:
-        print(f"Error fetching emails: {e}")
         return {"status": "error", "message": str(e)}, 500
 
     messages = search_response.get("messages", [])
     if not messages:
-        print("No emails found in this account.")
         return {"status": "success", "message": "No emails found."}
 
-    print(f"Total emails fetched: {len(messages)}")
     email_subjects = []
     processed_applicants = []
 
-    # 2. Loop over each email
     for msg in messages:
         msg_id = msg["id"]
         try:
@@ -83,15 +86,11 @@ def process_emails():
                 dangerously_skip_version_check=True,
                 user_id=entity_id
             )
-            # Get subject for logging
-            subject = next((h["value"] for h in email_data["payload"]["headers"] if h["name"]=="Subject"), "No Subject")
-            email_subjects.append(subject)
-            print(f"Found email subject: {subject}")
 
-            # Get sender
+            subject = next((h["value"] for h in email_data["payload"]["headers"] if h["name"] == "Subject"), "No Subject")
             sender = next((h["value"] for h in email_data["payload"]["headers"] if h["name"] == "From"), "Unknown Sender")
+            email_subjects.append(subject)
 
-            # Process attachments recursively
             if "parts" in email_data["payload"]:
                 attachments = find_attachments(email_data["payload"]["parts"])
                 for part in attachments:
@@ -102,10 +101,10 @@ def process_emails():
                         dangerously_skip_version_check=True,
                         user_id=entity_id
                     )
-                    file_data = base64.urlsafe_b64decode(attachment_data["data"])
 
-                    # Extract text
+                    file_data = base64.urlsafe_b64decode(attachment_data["data"])
                     extracted_text_resume = ""
+
                     if part["filename"].endswith(".pdf"):
                         with pdfplumber.open(io.BytesIO(file_data)) as pdf:
                             for page in pdf.pages:
@@ -113,7 +112,7 @@ def process_emails():
                     else:
                         extracted_text_resume = file_data.decode("utf-8")
 
-                    # Score resume against JD
+                    # Score resume
                     resume_lower = extracted_text_resume.lower()
                     matched_keywords = [k for k in jd_keywords if k in resume_lower]
                     missing_keywords = list(set(jd_keywords) - set(matched_keywords))
@@ -127,7 +126,7 @@ def process_emails():
                         "missing": missing_keywords
                     })
 
-                    # Mark email as read
+                    # Mark as read
                     composio.tools.execute(
                         slug="GMAIL_ADD_LABEL_TO_EMAIL",
                         arguments={
@@ -138,7 +137,6 @@ def process_emails():
                         dangerously_skip_version_check=True,
                         user_id=entity_id
                     )
-                    print(f"Processed {part['filename']} from {sender}, Score: {score:.2f}%")
 
         except Exception as e:
             print(f"Error processing message {msg_id}: {e}")
